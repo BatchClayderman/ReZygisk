@@ -722,7 +722,48 @@ void ZygiskContext::run_modules_post() {
 void ZygiskContext::app_specialize_pre() {
     flags[APP_SPECIALIZE] = true;
 
-    info_flags = rezygiskd_get_process_flags(g_ctx->args.app->uid, (const char *const)process);
+    /* INFO: Isolated services have different UIDs than the main apps. Because
+               numerous root implementations base themselves in the UID of the
+               app, we need to ensure that the UID sent to ReZygiskd to search
+               is the app's and not the isolated service, or else it will be
+               able to bypass DenyList.
+
+             All apps, and isolated processes, of *third-party* applications will
+               have their app_data_dir set. The system applications might not have
+               one, however it is unlikely they will create an isolated process,
+               and even if so, it should not impact in detections, performance or
+               any area.
+    */
+    uid_t uid = args.app->uid;
+    if (IS_ISOLATED_SERVICE(uid) && args.app->app_data_dir) {
+        /* INFO: If the app is an isolated service, we use the UID of the
+                   app's process data directory, which is the UID of the
+                   app itself, which root implementations actually use.
+        */
+        const char *data_dir = env->GetStringUTFChars(args.app->app_data_dir, NULL);
+        if (!data_dir) {
+            LOGE("Failed to get app data directory");
+
+            return;
+        }
+
+        struct stat st;
+        if (stat(data_dir, &st) == -1) {
+            PLOGE("Failed to stat app data directory [%s]", data_dir);
+
+            env->ReleaseStringUTFChars(args.app->app_data_dir, data_dir);
+
+            return;
+        }
+
+        uid = st.st_uid;
+
+        LOGD("Isolated service being related to UID %d, app data dir: %s", uid, data_dir);
+
+        env->ReleaseStringUTFChars(args.app->app_data_dir, data_dir);
+    }
+
+    info_flags = rezygiskd_get_process_flags(uid, (const char *const)process);
      if (info_flags & PROCESS_IS_FIRST_STARTED) {
         /* INFO: To ensure we are really using a clean mount namespace, we use
                    the first process it as reference for clean mount namespace,
@@ -753,21 +794,40 @@ void ZygiskContext::app_specialize_pre() {
         }
 
         /* INFO: Modules only have two "start off" points from Zygisk, preSpecialize and
-                   postSpecialize. While preSpecialie in fact runs with Zygote (not superuser)
-                   privileges, in postSpecialize it will now be with lower permission, in
-                   the app's sandbox and therefore can move to a clean mount namespace after
-                   executing the modules preSpecialize.
-        */
-        if ((info_flags & PROCESS_ON_DENYLIST) == PROCESS_ON_DENYLIST) {
-          flags[DO_REVERT_UNMOUNT] = true;
+                   postSpecialize. In preSpecialize, the process still has privileged 
+                   permissions, and therefore can execute mount/umount/setns functions.
+                   If we update the mount namespace AFTER executing them, any mounts made
+                   will be lost, and the process will not have access to them anymore.
 
-          update_mnt_ns(Clean, false);
+                 In postSpecialize, while still could have its mounts modified with the
+                   assistance of a Zygisk companion, it will already have the mount
+                   namespace switched by then, so there won't be issues.
+
+                 Knowing this, we update the mns before execution, so that they can still
+                   make changes to mounts in DenyListed processes without being reverted.
+        */
+        bool in_denylist = (info_flags & PROCESS_ON_DENYLIST) == PROCESS_ON_DENYLIST;
+        if (in_denylist) {
+            flags[DO_REVERT_UNMOUNT] = true;
+
+            update_mnt_ns(Clean, false);
         }
 
         /* INFO: Executed after setns to ensure a module can update the mounts of an 
                    application without worrying about it being overwritten by setns.
         */
         run_modules_pre();
+
+        /* INFO: The modules may request that although the process is NOT in
+                   the DenyList, it has its mount namespace switched to the clean
+                   one.
+
+                 So to ensure this behavior happens, we must also check after the
+                   modules are loaded and executed, so that the modules can have
+                   the chance to request it.
+        */
+        if (!in_denylist && flags[DO_REVERT_UNMOUNT])
+            update_mnt_ns(Clean, false);
     }
 }
 
